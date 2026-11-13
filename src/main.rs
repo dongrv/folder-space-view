@@ -4,52 +4,95 @@ use eframe::egui;
 
 mod ui;
 use std::{
-    path::PathBuf,
+    ffi::OsStr,
+    ops::Range,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver},
         Arc,
     },
-    thread,
+    thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 
 #[derive(Debug)]
 struct Node {
-    path: PathBuf,
+    // Only the final component is stored; the root path is kept once in ScanResult.
+    name: Box<OsStr>,
     size: u64,
     files: u64,
+    parent: usize,
+    // Children are inserted together, so no per-directory index allocation is needed.
+    children: Range<usize>,
     directory: bool,
-    children: Vec<usize>,
 }
 impl Node {
-    fn new(path: PathBuf, directory: bool, size: u64) -> Self {
+    fn new(name: Box<OsStr>, parent: usize, directory: bool, size: u64) -> Self {
         Self {
-            path,
+            name,
             size,
             files: if directory { 0 } else { 1 },
+            parent,
+            children: 0..0,
             directory,
-            children: Vec::new(),
         }
     }
-    fn name(&self) -> String {
-        self.path
-            .file_name()
-            .unwrap_or(self.path.as_os_str())
-            .to_string_lossy()
-            .into_owned()
+    fn name(&self) -> std::borrow::Cow<'_, str> {
+        self.name.to_string_lossy()
     }
 }
 struct ScanResult {
+    root: PathBuf,
     nodes: Vec<Node>,
     skipped_links: u64,
     skipped_errors: u64,
     first_error: Option<String>,
 }
-enum Event {
-    Progress(u64),
-    Finished(ScanResult),
-    Failed(String),
+impl ScanResult {
+    fn path(&self, index: usize) -> PathBuf {
+        node_path(&self.root, &self.nodes, index)
+    }
+}
+
+fn node_path(root: &Path, nodes: &[Node], mut index: usize) -> PathBuf {
+    let mut components = Vec::new();
+    while index != 0 {
+        let node = &nodes[index];
+        components.push(node.name.as_ref());
+        index = node.parent;
+    }
+    let mut path = root.to_path_buf();
+    for component in components.into_iter().rev() {
+        path.push(component);
+    }
+    path
+}
+
+fn is_link_or_special_directory(meta: &std::fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        meta.file_type().is_symlink()
+            || (meta.is_dir() && meta.file_attributes() & 0x400 != 0)
+    }
+    #[cfg(not(windows))]
+    {
+        meta.file_type().is_symlink()
+    }
+}
+
+fn aggregate(nodes: &mut [Node], cancel: &AtomicBool) -> bool {
+    // Parents precede children; propagate one child at a time so cancellation stays responsive.
+    for i in (1..nodes.len()).rev() {
+        if cancel.load(Ordering::Relaxed) {
+            return false;
+        }
+        let parent = nodes[i].parent;
+        nodes[parent].size = nodes[parent].size.saturating_add(nodes[i].size);
+        nodes[parent].files = nodes[parent].files.saturating_add(nodes[i].files);
+    }
+    !cancel.load(Ordering::Relaxed)
 }
 
 // Iterate without following reparse points/symlinks; aggregate in reverse insertion order.
@@ -58,11 +101,17 @@ fn scan(
     cancel: &AtomicBool,
     mut progress: impl FnMut(u64),
 ) -> Result<Option<ScanResult>, String> {
+    if cancel.load(Ordering::Relaxed) {
+        return Ok(None);
+    }
     let meta = std::fs::symlink_metadata(&root).map_err(|e| format!("无法读取所选目录：{e}"))?;
+    if is_link_or_special_directory(&meta) {
+        return Err("所选目录是链接或 Windows 特殊目录，无法扫描".into());
+    }
     if !meta.is_dir() {
         return Err("所选路径不是文件夹".into());
     }
-    let mut nodes = vec![Node::new(root, true, 0)];
+    let mut nodes = vec![Node::new(Box::from(OsStr::new("")), 0, true, 0)];
     let mut stack = vec![0usize];
     let mut skipped_links = 0u64;
     let mut skipped_errors = 0u64;
@@ -73,17 +122,19 @@ fn scan(
         if cancel.load(Ordering::Relaxed) {
             return Ok(None);
         }
-        let entries = match std::fs::read_dir(&nodes[index].path) {
+        let directory_path = node_path(&root, &nodes, index);
+        let entries = match std::fs::read_dir(&directory_path) {
             Ok(v) => v,
             Err(e) => {
                 if index == 0 {
                     return Err(format!("无法读取所选目录：{e}"));
                 }
                 skipped_errors += 1;
-                first_error.get_or_insert_with(|| format!("{}：{e}", nodes[index].path.display()));
+                first_error.get_or_insert_with(|| format!("{}：{e}", directory_path.display()));
                 continue;
             }
         };
+        let first_child = nodes.len();
         for entry in entries {
             if cancel.load(Ordering::Relaxed) {
                 return Ok(None);
@@ -92,44 +143,36 @@ fn scan(
                 Ok(v) => v,
                 Err(e) => {
                     skipped_errors += 1;
-                    first_error
-                        .get_or_insert_with(|| format!("{}：{e}", nodes[index].path.display()));
+                    first_error.get_or_insert_with(|| format!("{}：{e}", directory_path.display()));
                     continue;
                 }
             };
-            let meta = match std::fs::symlink_metadata(entry.path()) {
+            let entry_path = entry.path();
+            let meta = match std::fs::symlink_metadata(&entry_path) {
                 Ok(v) => v,
                 Err(e) => {
                     skipped_errors += 1;
-                    first_error.get_or_insert_with(|| format!("{}：{e}", entry.path().display()));
+                    first_error.get_or_insert_with(|| format!("{}：{e}", entry_path.display()));
                     continue;
                 }
             };
-            // Windows junctions are reparse points even when reported as directories.
-            #[cfg(windows)]
-            let is_link = {
-                use std::os::windows::fs::MetadataExt;
-                meta.file_type().is_symlink()
-                    || (meta.is_dir() && meta.file_attributes() & 0x400 != 0)
-            };
-            #[cfg(not(windows))]
-            let is_link = meta.file_type().is_symlink();
-            if is_link {
+            if is_link_or_special_directory(&meta) {
                 skipped_links += 1;
                 continue;
             }
-            if !meta.is_dir() && !meta.is_file() {
+            let directory = meta.is_dir();
+            if !directory && !meta.is_file() {
                 skipped_errors += 1;
                 continue;
             }
             let child = nodes.len();
             nodes.push(Node::new(
-                entry.path(),
-                meta.is_dir(),
-                if meta.is_file() { meta.len() } else { 0 },
+                entry.file_name().into_boxed_os_str(),
+                index,
+                directory,
+                if directory { 0 } else { meta.len() },
             ));
-            nodes[index].children.push(child);
-            if meta.is_dir() {
+            if directory {
                 stack.push(child);
             }
             seen += 1;
@@ -138,21 +181,13 @@ fn scan(
                 last = Instant::now();
             }
         }
+        nodes[index].children = first_child..nodes.len();
     }
-    // Every parent is inserted before its children, so reverse order is postorder.
-    for i in (0..nodes.len()).rev() {
-        let (size, files) = nodes[i].children.iter().fold((0u64, 0u64), |(s, f), &c| {
-            (
-                s.saturating_add(nodes[c].size),
-                f.saturating_add(nodes[c].files),
-            )
-        });
-        if nodes[i].directory {
-            nodes[i].size = size;
-            nodes[i].files = files;
-        }
+    if !aggregate(&mut nodes, cancel) {
+        return Ok(None);
     }
     Ok(Some(ScanResult {
+        root,
         nodes,
         skipped_links,
         skipped_errors,
@@ -185,8 +220,10 @@ fn percent(part: u64, total: u64) -> f32 {
 struct App {
     result: Option<ScanResult>,
     trail: Vec<usize>,
-    rx: Option<Receiver<Event>>,
+    rx: Option<Receiver<u64>>,
     cancel: Option<Arc<AtomicBool>>,
+    worker: Option<JoinHandle<Result<Option<ScanResult>, String>>>,
+    pending: Option<(PathBuf, egui::Context)>,
     scanned: u64,
     search: String,
     sort_name: bool,
@@ -205,6 +242,8 @@ impl Default for App {
             trail: vec![0],
             rx: None,
             cancel: None,
+            worker: None,
+            pending: None,
             scanned: 0,
             search: String::new(),
             sort_name: false,
@@ -220,7 +259,11 @@ impl Default for App {
 }
 impl App {
     fn start(&mut self, path: PathBuf, ctx: egui::Context) {
-        self.stop();
+        if self.worker.is_some() {
+            self.stop();
+            self.pending = Some((path, ctx));
+            return;
+        }
         self.last_path = Some(path.clone());
         self.scanned = 0;
         self.message = None;
@@ -228,55 +271,61 @@ impl App {
         self.trail = vec![0];
         self.selected = None;
         self.cached_key = None;
-        self.cached_children.clear();
+        self.cached_children = Vec::new();
         self.cached_chart_current = None;
         self.cached_chart.clear();
         self.search.clear();
         let (tx, rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
         let flag = cancel.clone();
-        thread::spawn(move || {
+        let worker = thread::spawn(move || {
             let result = scan(path, &flag, |n| {
-                let _ = tx.send(Event::Progress(n));
+                let _ = tx.send(n);
                 ctx.request_repaint();
             });
-            let event = match result {
-                Ok(Some(r)) => Some(Event::Finished(r)),
-                Ok(None) => None,
-                Err(e) => Some(Event::Failed(e)),
-            };
-            if let Some(event) = event {
-                let _ = tx.send(event);
-                ctx.request_repaint();
-            }
+            ctx.request_repaint();
+            result
         });
         self.rx = Some(rx);
         self.cancel = Some(cancel);
+        self.worker = Some(worker);
     }
     fn stop(&mut self) {
-        if let Some(c) = self.cancel.take() {
+        self.pending = None;
+        if let Some(c) = &self.cancel {
             c.store(true, Ordering::Relaxed);
         }
-        self.rx = None;
     }
-    fn events(&mut self) {
+    fn stopping(&self) -> bool {
+        self.cancel
+            .as_ref()
+            .is_some_and(|c| c.load(Ordering::Relaxed))
+    }
+    fn events(&mut self, ctx: &egui::Context) {
         if let Some(rx) = &self.rx {
-            while let Ok(event) = rx.try_recv() {
-                match event {
-                    Event::Progress(n) => self.scanned = n,
-                    Event::Finished(r) => {
-                        self.result = Some(r);
-                        self.cancel = None;
-                    }
-                    Event::Failed(e) => {
-                        self.message = Some(e);
-                        self.cancel = None;
-                    }
-                }
+            while let Ok(n) = rx.try_recv() {
+                self.scanned = n;
             }
         }
-        if self.cancel.is_none() {
+        if self.worker.as_ref().is_some_and(JoinHandle::is_finished) {
+            let worker = self.worker.take().unwrap();
+            let cancelled = self.stopping();
+            self.cancel = None;
             self.rx = None;
+            match worker.join() {
+                Err(_) => self.message = Some("后台扫描线程异常退出（panic）".into()),
+                Ok(_) if cancelled => self.message = Some("扫描已取消".into()),
+                Ok(Ok(Some(result))) => self.result = Some(result),
+                Ok(Ok(None)) => self.message = Some("扫描已取消".into()),
+                Ok(Err(error)) => self.message = Some(error),
+            }
+            if let Some((path, ctx)) = self.pending.take() {
+                self.start(path, ctx);
+            }
+        }
+        if self.worker.is_some() {
+            // A panicked worker cannot request a repaint, so poll without blocking the UI.
+            ctx.request_repaint_after(Duration::from_millis(100));
         }
     }
 }
@@ -311,6 +360,14 @@ fn main() -> eframe::Result {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn wait_for_worker(app: &App) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !app.worker.as_ref().unwrap().is_finished() {
+            assert!(Instant::now() < deadline, "worker did not finish");
+            thread::yield_now();
+        }
+    }
+
     #[test]
     fn formats_and_percentages() {
         assert_eq!(size(1024), "1.00 KB");
@@ -330,8 +387,142 @@ mod tests {
             .unwrap();
         assert_eq!(result.nodes[0].size, 18);
         assert_eq!(result.nodes[0].files, 2);
+        let folder = result.nodes[0].children.clone()
+            .find(|&i| result.nodes[i].name() == "nested")
+            .unwrap();
+        let file = result.nodes[folder].children.clone().next().unwrap();
+        assert_eq!(result.nodes[folder].size, 11);
+        assert_eq!(result.nodes[folder].files, 1);
+        assert_eq!(result.path(folder), root.join("nested"));
+        assert_eq!(result.path(file), root.join("nested/b"));
         #[cfg(unix)]
         assert_eq!(result.skipped_links, 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn panic_ends_scanning_and_reports_failure() {
+        let mut app = App::default();
+        app.cancel = Some(Arc::new(AtomicBool::new(false)));
+        app.worker = Some(thread::spawn(|| panic!("simulated scan panic")));
+        wait_for_worker(&app);
+        app.events(&egui::Context::default());
+        assert!(app.worker.is_none());
+        assert!(app.cancel.is_none());
+        assert!(app.message.as_deref().unwrap().contains("panic"));
+    }
+
+    #[test]
+    fn replacement_waits_for_cancelled_worker() {
+        let root = std::env::temp_dir().join(format!("disk-insight-replace-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("file"), [0; 7]).unwrap();
+        let (release, blocked) = mpsc::channel();
+        let mut app = App::default();
+        app.cancel = Some(Arc::new(AtomicBool::new(false)));
+        app.worker = Some(thread::spawn(move || {
+            blocked.recv().unwrap();
+            Ok(None)
+        }));
+        app.last_path = Some(PathBuf::from("previous"));
+        let ctx = egui::Context::default();
+        app.start(root.clone(), ctx.clone());
+        assert!(app.stopping());
+        app.events(&ctx);
+        assert!(app.pending.is_some());
+        assert_eq!(app.last_path.as_deref(), Some(Path::new("previous")));
+        release.send(()).unwrap();
+        wait_for_worker(&app);
+        app.events(&ctx);
+        assert!(app.pending.is_none());
+        assert_eq!(app.last_path.as_deref(), Some(root.as_path()));
+        wait_for_worker(&app);
+        app.events(&ctx);
+        assert_eq!(app.result.as_ref().unwrap().nodes[0].size, 7);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cancelling_waits_and_discards_a_late_result() {
+        let (release, blocked) = mpsc::channel();
+        let mut app = App::default();
+        app.cancel = Some(Arc::new(AtomicBool::new(false)));
+        app.worker = Some(thread::spawn(move || {
+            blocked.recv().unwrap();
+            Ok(Some(ScanResult {
+                root: PathBuf::from("late"),
+                nodes: vec![Node::new(Box::from(OsStr::new("")), 0, true, 0)],
+                skipped_links: 0,
+                skipped_errors: 0,
+                first_error: None,
+            }))
+        }));
+        let ctx = egui::Context::default();
+        app.start(PathBuf::from("not-started"), ctx.clone());
+        assert!(app.pending.is_some());
+        app.stop();
+        assert!(app.pending.is_none());
+        app.events(&ctx);
+        assert!(app.worker.is_some());
+        assert!(app.stopping());
+        release.send(()).unwrap();
+        wait_for_worker(&app);
+        app.events(&ctx);
+        assert!(app.worker.is_none());
+        assert!(app.result.is_none());
+        assert_eq!(app.message.as_deref(), Some("扫描已取消"));
+    }
+
+    #[test]
+    fn aggregation_honours_cancellation() {
+        let mut nodes = vec![
+            Node::new(Box::from(OsStr::new("")), 0, true, 0),
+            Node::new(Box::from(OsStr::new("file")), 0, false, 7),
+        ];
+        assert!(!aggregate(&mut nodes, &AtomicBool::new(true)));
+        assert_eq!(nodes[0].size, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlink_root_and_preserves_non_unicode_paths() {
+        use std::os::unix::{ffi::OsStringExt, fs::symlink};
+        let root = std::env::temp_dir().join(format!("disk-insight-links-{}", std::process::id()));
+        let target = root.join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        let name = std::ffi::OsString::from_vec(vec![b'f', 0x80]);
+        std::fs::write(target.join(&name), [0; 3]).unwrap();
+        let link = root.join("link");
+        symlink(&target, &link).unwrap();
+        let error = scan(link, &AtomicBool::new(false), |_| {}).err().unwrap();
+        assert!(error.contains("链接"));
+        let result = scan(target.clone(), &AtomicBool::new(false), |_| {}).unwrap().unwrap();
+        let file = result.nodes[0].children.clone().next().unwrap();
+        assert_eq!(result.path(file), target.join(name));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rejects_junction_root_and_skips_junction_child() {
+        let root = std::env::temp_dir().join(format!("disk-insight-junction-{}", std::process::id()));
+        let target = root.join("target");
+        let junction = root.join("junction");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("file"), [0; 5]).unwrap();
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&junction)
+            .arg(&target)
+            .status()
+            .unwrap();
+        assert!(status.success(), "failed to create junction");
+        let error = scan(junction.clone(), &AtomicBool::new(false), |_| {}).err().unwrap();
+        assert!(error.contains("特殊目录"));
+        let result = scan(root.clone(), &AtomicBool::new(false), |_| {}).unwrap().unwrap();
+        assert_eq!(result.skipped_links, 1);
+        assert_eq!(result.nodes[0].size, 5);
+        std::fs::remove_dir(junction).unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }
 }

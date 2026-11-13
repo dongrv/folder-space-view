@@ -144,7 +144,7 @@ impl App {
             }
             Action::Copy(i) => {
                 if let Some(r) = &self.result {
-                    ctx.copy_text(r.nodes[i].path.display().to_string());
+                    ctx.copy_text(r.path(i).display().to_string());
                 }
             }
             Action::Open(i) => {
@@ -152,12 +152,13 @@ impl App {
                     #[cfg(windows)]
                     {
                         let node = &r.nodes[i];
+                        let path = r.path(i);
                         let mut command = std::process::Command::new("explorer.exe");
                         if node.directory {
-                            command.arg(&node.path);
+                            command.arg(&path);
                         } else {
                             let mut arg = std::ffi::OsString::from("/select,");
-                            arg.push(&node.path);
+                            arg.push(&path);
                             command.arg(arg);
                         }
                         if let Err(e) = command.spawn() {
@@ -179,26 +180,42 @@ impl App {
         };
         let current = *self.trail.last().unwrap();
         if self.cached_chart_current != Some(current) {
-            self.cached_chart = result.nodes[current].children.clone();
-            self.cached_chart
-                .sort_unstable_by_key(|&i| std::cmp::Reverse(result.nodes[i].size));
-            self.cached_chart.truncate(32);
+            use std::{cmp::Reverse, collections::BinaryHeap};
+            let mut largest = BinaryHeap::with_capacity(32);
+            for i in result.nodes[current].children.clone() {
+                let item = Reverse((result.nodes[i].size, i));
+                if largest.len() < 32 {
+                    largest.push(item);
+                } else if largest.peek().is_some_and(|smallest| item < *smallest) {
+                    *largest.peek_mut().unwrap() = item;
+                }
+            }
+            self.cached_chart = largest
+                .into_sorted_vec()
+                .into_iter()
+                .map(|Reverse((_, i))| i)
+                .collect();
             self.cached_chart_current = Some(current);
         }
         let key = (current, self.search.to_lowercase(), self.sort_name);
         if self.cached_key.as_ref() == Some(&key) {
             return;
         }
-        let mut children: Vec<_> = result.nodes[current]
-            .children
-            .iter()
-            .copied()
-            .filter(|&i| key.1.is_empty() || result.nodes[i].name().to_lowercase().contains(&key.1))
-            .collect();
-        if self.sort_name {
-            children.sort_by_cached_key(|&i| result.nodes[i].name().to_lowercase());
+        if self.cached_key.as_ref().is_some_and(|(directory, _, _)| *directory == current) {
+            self.cached_children.clear();
         } else {
-            children.sort_by(|&a, &b| {
+            self.cached_children = Vec::new();
+        }
+        self.cached_children.extend(
+            result.nodes[current]
+                .children
+                .clone()
+                .filter(|&i| key.1.is_empty() || result.nodes[i].name().to_lowercase().contains(&key.1)),
+        );
+        if self.sort_name {
+            self.cached_children.sort_by_cached_key(|&i| result.nodes[i].name().to_lowercase());
+        } else {
+            self.cached_children.sort_unstable_by(|&a, &b| {
                 result.nodes[b]
                     .size
                     .cmp(&result.nodes[a].size)
@@ -206,7 +223,6 @@ impl App {
             });
         }
         self.cached_key = Some(key);
-        self.cached_children = children;
     }
 }
 
@@ -499,15 +515,17 @@ fn item_list(
                         ui.close_menu();
                     }
                 });
-                response.on_hover_text(format!(
-                    "{}\n{}",
-                    node.path.display(),
-                    if node.directory {
-                        "双击进入 · 右键更多操作"
-                    } else {
-                        "右键更多操作"
-                    }
-                ));
+                response.on_hover_ui(|ui| {
+                    ui.label(format!(
+                        "{}\n{}",
+                        result.path(i).display(),
+                        if node.directory {
+                            "双击进入 · 右键更多操作"
+                        } else {
+                            "右键更多操作"
+                        }
+                    ));
+                });
             }
         });
     (action, painted)
@@ -515,7 +533,7 @@ fn item_list(
 
 impl App {
     fn draw(&mut self, ctx: &egui::Context) {
-        self.events();
+        self.events(ctx);
         let mut action = None;
         egui::TopBottomPanel::top("header")
             .frame(
@@ -596,16 +614,26 @@ impl App {
             .show(ctx, |ui| {
                 if self.cancel.is_some() {
                     ui.add_space(75.0);
-                    txt(ui, "正在分析文件夹", 25.0, TEXT);
+                    let stopping = self.stopping();
+                    txt(ui, if stopping { "正在停止扫描" } else { "正在分析文件夹" }, 25.0, TEXT);
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
                         ui.spinner();
                         txt(ui, format!("已发现 {} 个项目", self.scanned), 14.0, MUTED);
-                        if button(ui, "取消扫描").clicked() {
+                        if !stopping && button(ui, "取消扫描").clicked() {
                             self.stop();
-                            self.message = Some("扫描已取消".into());
+                        } else if stopping && self.pending.is_some() && button(ui, "取消新扫描").clicked() {
+                            self.stop();
                         }
                     });
+                    if stopping {
+                        let detail = if self.pending.is_some() {
+                            "正在等待当前扫描退出，随后开始新扫描。"
+                        } else {
+                            "正在等待当前文件系统操作和扫描线程退出。"
+                        };
+                        txt(ui, detail, 13.0, MUTED);
+                    }
                     if let Some(path) = &self.last_path {
                         txt(ui, path.display().to_string(), 13.0, MUTED);
                     }
@@ -652,9 +680,9 @@ impl App {
                                         txt(ui, "/", 13.0, MUTED);
                                     }
                                     let name = if level == 0 {
-                                        result.nodes[i].path.display().to_string()
+                                        result.root.display().to_string()
                                     } else {
-                                        result.nodes[i].name()
+                                        result.nodes[i].name().into_owned()
                                     };
                                     if ui
                                         .link(
@@ -800,6 +828,10 @@ mod tests {
     use super::*;
     use crate::Node;
     use std::path::PathBuf;
+
+    fn node(name: &str, parent: usize, directory: bool, size: u64) -> Node {
+        Node::new(std::ffi::OsStr::new(name).into(), parent, directory, size)
+    }
     #[test]
     fn map_preserves_proportions() {
         let mut tiles = Vec::new();
@@ -815,18 +847,20 @@ mod tests {
     }
     #[test]
     fn list_uses_the_available_viewport() {
-        let mut nodes = vec![Node::new(PathBuf::from("root"), true, 100)];
+        let mut nodes = vec![node("", 0, true, 100)];
         for i in 0..40 {
-            nodes.push(Node::new(PathBuf::from(format!("item{i}")), false, 1));
-            nodes[0].children.push(i + 1);
+            nodes.push(node(&format!("item{i}"), 0, false, 1));
         }
+        nodes[0].children = 1..nodes.len();
         let result = ScanResult {
+            root: PathBuf::from("root"),
             nodes,
             skipped_links: 0,
             skipped_errors: 0,
             first_error: None,
         };
         let ctx = egui::Context::default();
+        let children: Vec<_> = result.nodes[0].children.clone().collect();
         let mut painted = 0;
         let _ = ctx.run(
             egui::RawInput {
@@ -835,7 +869,7 @@ mod tests {
             },
             |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    let (_, count) = item_list(ui, &result, 0, &result.nodes[0].children, None);
+                    let (_, count) = item_list(ui, &result, 0, &children, None);
                     painted = count;
                 });
             },
@@ -846,14 +880,15 @@ mod tests {
 
     #[test]
     fn navigation_search_and_chart_stay_consistent() {
-        let mut root = Node::new(PathBuf::from("root"), true, 0);
+        let mut root = node("", 0, true, 0);
         root.size = 30;
-        root.children = vec![1, 2];
-        let mut folder = Node::new(PathBuf::from("root/folder"), true, 0);
+        root.children = 1..3;
+        let mut folder = node("folder", 0, true, 0);
         folder.size = 20;
-        let file = Node::new(PathBuf::from("root/file"), false, 10);
+        let file = node("file", 0, false, 10);
         let mut app = App::default();
         app.result = Some(ScanResult {
+            root: PathBuf::from("root"),
             nodes: vec![root, folder, file],
             skipped_links: 0,
             skipped_errors: 0,
@@ -878,6 +913,59 @@ mod tests {
     }
 
     #[test]
+    fn chart_shows_the_largest_thirty_two_items() {
+        let mut root = node("", 0, true, 0);
+        let mut nodes = vec![node("", 0, true, 0)];
+        for i in 0..100 {
+            nodes.push(node(&format!("item-{i}"), 0, false, i));
+        }
+        root.children = 1..nodes.len();
+        nodes[0] = root;
+        let mut app = App::default();
+        app.result = Some(ScanResult {
+            root: PathBuf::from("root"),
+            nodes,
+            skipped_links: 0,
+            skipped_errors: 0,
+            first_error: None,
+        });
+        app.refresh_list();
+        let result = app.result.as_ref().unwrap();
+        let sizes: Vec<_> = app.cached_chart.iter().map(|&i| result.nodes[i].size).collect();
+        assert_eq!(sizes, (68..100).rev().collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn cancellation_remains_visible_until_worker_exits() {
+        fn contains_text(shape: &egui::Shape, text: &str) -> bool {
+            match shape {
+                egui::Shape::Text(label) => label.galley.job.text == text,
+                egui::Shape::Vec(shapes) => shapes.iter().any(|shape| contains_text(shape, text)),
+                _ => false,
+            }
+        }
+        let (release, blocked) = std::sync::mpsc::channel();
+        let mut app = App::default();
+        app.cancel = Some(Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        app.worker = Some(std::thread::spawn(move || {
+            blocked.recv().unwrap();
+            Ok(None)
+        }));
+        app.stop();
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| app.draw(ctx));
+        assert!(output.shapes.iter().any(|s| contains_text(&s.shape, "正在停止扫描")));
+        release.send(()).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !app.worker.as_ref().unwrap().is_finished() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        let output = ctx.run(egui::RawInput::default(), |ctx| app.draw(ctx));
+        assert!(output.shapes.iter().any(|s| contains_text(&s.shape, "扫描已取消")));
+    }
+
+    #[test]
     fn full_window_renders_multiple_rows() {
         fn count_rows(shape: &egui::Shape) -> usize {
             match shape {
@@ -888,20 +976,17 @@ mod tests {
                 _ => 0,
             }
         }
-        let mut root = Node::new(PathBuf::from("root"), true, 0);
+        let mut root = node("", 0, true, 0);
         let mut nodes = vec![];
         for i in 0..40 {
-            root.children.push(i + 1);
-            nodes.push(Node::new(
-                PathBuf::from(format!("fixture-{i:02}")),
-                false,
-                1,
-            ));
+            nodes.push(node(&format!("fixture-{i:02}"), 0, false, 1));
         }
+        root.children = 1..nodes.len() + 1;
         root.size = 40;
         nodes.insert(0, root);
         let mut app = App::default();
         app.result = Some(ScanResult {
+            root: PathBuf::from("root"),
             nodes,
             skipped_links: 0,
             skipped_errors: 0,
