@@ -3,6 +3,7 @@
 use eframe::egui;
 
 mod ui;
+mod treemap;
 use std::{
     ffi::OsStr,
     ops::Range,
@@ -42,12 +43,16 @@ impl Node {
         self.name.to_string_lossy()
     }
 }
+const ERROR_DETAIL_LIMIT: usize = 50;
+const LARGEST_FILE_LIMIT: usize = 100;
+
 struct ScanResult {
     root: PathBuf,
     nodes: Vec<Node>,
     skipped_links: u64,
     skipped_errors: u64,
-    first_error: Option<String>,
+    error_details: Vec<String>,
+    largest_files: Vec<usize>,
 }
 impl ScanResult {
     fn path(&self, index: usize) -> PathBuf {
@@ -95,6 +100,25 @@ fn aggregate(nodes: &mut [Node], cancel: &AtomicBool) -> bool {
     !cancel.load(Ordering::Relaxed)
 }
 
+fn record_error(count: &mut u64, details: &mut Vec<String>, path: &Path, reason: impl std::fmt::Display) {
+    *count += 1;
+    if details.len() < ERROR_DETAIL_LIMIT {
+        details.push(format!("{}：{reason}", path.display()));
+    }
+}
+
+fn record_largest(largest: &mut Vec<usize>, nodes: &[Node], index: usize) {
+    let position = largest.binary_search_by(|&other| {
+        nodes[other].size.cmp(&nodes[index].size).reverse().then(other.cmp(&index))
+    }).unwrap_or_else(|position| position);
+    if position < LARGEST_FILE_LIMIT {
+        if largest.len() == LARGEST_FILE_LIMIT {
+            largest.pop();
+        }
+        largest.insert(position, index);
+    }
+}
+
 // Iterate without following reparse points/symlinks; aggregate in reverse insertion order.
 fn scan(
     root: PathBuf,
@@ -115,7 +139,8 @@ fn scan(
     let mut stack = vec![0usize];
     let mut skipped_links = 0u64;
     let mut skipped_errors = 0u64;
-    let mut first_error = None;
+    let mut error_details = Vec::new();
+    let mut largest_files = Vec::new();
     let mut seen = 0u64;
     let mut last = Instant::now();
     while let Some(index) = stack.pop() {
@@ -129,8 +154,7 @@ fn scan(
                 if index == 0 {
                     return Err(format!("无法读取所选目录：{e}"));
                 }
-                skipped_errors += 1;
-                first_error.get_or_insert_with(|| format!("{}：{e}", directory_path.display()));
+                record_error(&mut skipped_errors, &mut error_details, &directory_path, e);
                 continue;
             }
         };
@@ -142,8 +166,7 @@ fn scan(
             let entry = match entry {
                 Ok(v) => v,
                 Err(e) => {
-                    skipped_errors += 1;
-                    first_error.get_or_insert_with(|| format!("{}：{e}", directory_path.display()));
+                    record_error(&mut skipped_errors, &mut error_details, &directory_path, e);
                     continue;
                 }
             };
@@ -151,8 +174,7 @@ fn scan(
             let meta = match std::fs::symlink_metadata(&entry_path) {
                 Ok(v) => v,
                 Err(e) => {
-                    skipped_errors += 1;
-                    first_error.get_or_insert_with(|| format!("{}：{e}", entry_path.display()));
+                    record_error(&mut skipped_errors, &mut error_details, &entry_path, e);
                     continue;
                 }
             };
@@ -162,7 +184,7 @@ fn scan(
             }
             let directory = meta.is_dir();
             if !directory && !meta.is_file() {
-                skipped_errors += 1;
+                record_error(&mut skipped_errors, &mut error_details, &entry_path, "不是普通文件或目录");
                 continue;
             }
             let child = nodes.len();
@@ -174,6 +196,8 @@ fn scan(
             ));
             if directory {
                 stack.push(child);
+            } else {
+                record_largest(&mut largest_files, &nodes, child);
             }
             seen += 1;
             if last.elapsed() >= Duration::from_millis(150) {
@@ -191,7 +215,8 @@ fn scan(
         nodes,
         skipped_links,
         skipped_errors,
-        first_error,
+        error_details,
+        largest_files,
     }))
 }
 
@@ -218,6 +243,9 @@ fn percent(part: u64, total: u64) -> f32 {
 }
 
 struct App {
+    theme: ui::Theme,
+    view: ui::View,
+    show_errors: bool,
     result: Option<ScanResult>,
     trail: Vec<usize>,
     rx: Option<Receiver<u64>>,
@@ -230,14 +258,16 @@ struct App {
     selected: Option<usize>,
     cached_key: Option<(usize, String, bool)>,
     cached_children: Vec<usize>,
-    cached_chart_current: Option<usize>,
-    cached_chart: Vec<usize>,
+    map: ui::MapCache,
     message: Option<String>,
     last_path: Option<PathBuf>,
 }
 impl Default for App {
     fn default() -> Self {
         Self {
+            theme: ui::Theme::Light,
+            view: ui::View::Treemap,
+            show_errors: false,
             result: None,
             trail: vec![0],
             rx: None,
@@ -250,8 +280,7 @@ impl Default for App {
             selected: None,
             cached_key: None,
             cached_children: Vec::new(),
-            cached_chart_current: None,
-            cached_chart: Vec::new(),
+            map: ui::MapCache::default(),
             message: None,
             last_path: None,
         }
@@ -268,12 +297,13 @@ impl App {
         self.scanned = 0;
         self.message = None;
         self.result = None;
+        self.view = ui::View::Treemap;
+        self.show_errors = false;
         self.trail = vec![0];
         self.selected = None;
         self.cached_key = None;
         self.cached_children = Vec::new();
-        self.cached_chart_current = None;
-        self.cached_chart.clear();
+        self.map = ui::MapCache::default();
         self.search.clear();
         let (tx, rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
@@ -395,9 +425,79 @@ mod tests {
         assert_eq!(result.nodes[folder].files, 1);
         assert_eq!(result.path(folder), root.join("nested"));
         assert_eq!(result.path(file), root.join("nested/b"));
+        assert_eq!(result.largest_files, vec![file, result.nodes[0].children.clone().find(|&i| result.nodes[i].name() == "a").unwrap()]);
         #[cfg(unix)]
         assert_eq!(result.skipped_links, 1);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn largest_files_include_empty_files() {
+        let root = std::env::temp_dir().join(format!("disk-insight-empty-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("empty"), []).unwrap();
+        let result = scan(root.clone(), &AtomicBool::new(false), |_| {}).unwrap().unwrap();
+        assert_eq!(result.largest_files.len(), 1);
+        assert_eq!(result.path(result.largest_files[0]), root.join("empty"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn largest_files_are_bounded_and_ties_use_node_index() {
+        let root = std::env::temp_dir().join(format!("disk-insight-ranking-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("nested")).unwrap();
+        for i in 0..105 {
+            std::fs::write(root.join("nested").join(format!("file-{i}")), [0; 3]).unwrap();
+        }
+        std::fs::write(root.join("empty"), []).unwrap();
+        let result = scan(root.clone(), &AtomicBool::new(false), |_| {}).unwrap().unwrap();
+        let mut expected: Vec<_> = result.nodes.iter().enumerate()
+            .filter_map(|(i, node)| (!node.directory && node.size == 3).then_some(i))
+            .collect();
+        expected.truncate(LARGEST_FILE_LIMIT);
+        assert_eq!(result.largest_files, expected);
+        assert_eq!(result.largest_files.len(), LARGEST_FILE_LIMIT);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn error_details_are_bounded_and_lazily_formatted() {
+        struct Reason(bool);
+        impl std::fmt::Display for Reason {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                assert!(self.0, "reason formatted after limit");
+                f.write_str("failure")
+            }
+        }
+        let mut count = 0;
+        let mut details = Vec::new();
+        for i in 0..ERROR_DETAIL_LIMIT + 3 {
+            record_error(&mut count, &mut details, Path::new("actual-path"), Reason(i < ERROR_DETAIL_LIMIT));
+        }
+        assert_eq!(count, (ERROR_DETAIL_LIMIT + 3) as u64);
+        assert_eq!(details.len(), ERROR_DETAIL_LIMIT);
+        assert!(details.iter().all(|detail| detail.contains("actual-path") && detail.contains("failure")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_regular_entries_have_real_error_details() {
+        use std::os::unix::net::UnixListener;
+        let root = std::env::temp_dir().join(format!("disk-insight-special-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("socket");
+        let _socket = UnixListener::bind(&path).unwrap();
+        let result = scan(root.clone(), &AtomicBool::new(false), |_| {}).unwrap().unwrap();
+        assert_eq!(result.skipped_errors, 1);
+        assert!(result.error_details[0].contains(&path.to_string_lossy().into_owned()));
+        assert!(result.error_details[0].contains("不是普通文件或目录"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn scan_honours_preexisting_cancellation() {
+        assert!(scan(PathBuf::from("unused"), &AtomicBool::new(true), |_| panic!("unexpected progress"))
+            .unwrap().is_none());
     }
 
     #[test]
@@ -454,7 +554,8 @@ mod tests {
                 nodes: vec![Node::new(Box::from(OsStr::new("")), 0, true, 0)],
                 skipped_links: 0,
                 skipped_errors: 0,
-                first_error: None,
+                error_details: Vec::new(),
+                largest_files: Vec::new(),
             }))
         }));
         let ctx = egui::Context::default();
